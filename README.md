@@ -36,8 +36,8 @@ Este sistema representa una capa crítica de defensa en un panorama donde los de
 
 ### Implementación prioritaria (baja complejidad)
 - [ ] **Análisis de metadatos**
-  - [ ] Revisión de datos EXIF (fecha, dispositivo, software de edición)
-  - [ ] Detección de inconsistencias en metadatos técnicos (resolución, formato, codecs)
+  - [X] Revisión de datos EXIF (fecha, dispositivo, software de edición)
+  - [X] Detección de inconsistencias en metadatos técnicos (resolución, formato, codecs)
   - [ ] Comparación de hashes contra bases de datos de archivos originales
 
 - [ ] **Redes neuronales preentrenadas**
@@ -71,3 +71,59 @@ Este sistema representa una capa crítica de defensa en un panorama donde los de
 
 **Priorización técnica:**  
 El orden refleja el esfuerzo estimado y los recursos necesarios (desde análisis básico de archivos hasta técnicas que requieren GPU y datasets especializados).  
+
+# Guía rápida de uso de la API DeepFakeDetector (.NET 8)
+
+## Estructura de carpetas del proyecto
+
+- **src/Controllers/**  
+  Controladores de la API. Aquí está el punto de entrada de las peticiones HTTP, por ejemplo, `FileController.cs`.
+
+- **src/Models/**  
+  Modelos de datos usados para las peticiones y respuestas de la API. Incluye modelos como `ExifResponse`, `ExifSimpleResponse`, `TechWarnings`, etc.
+
+- **src/Services/**  
+  Lógica de negocio y análisis. Aquí están servicios como `ExifService` (procesamiento de metadatos) y `TechnicalValidator` (validación técnica).
+
+- **src/Utils/**  
+  Funciones auxiliares y validadores de archivos.
+
+- **appsettings.json**  
+  Archivo de configuración editable por el usuario, donde se pueden definir resoluciones esperadas para dispositivos y otros parámetros técnicos.
+
+---
+
+## Cómo usar la API
+
+1. **Arranca la API**  
+   Ejecuta el proyecto con Visual Studio, Rider o `dotnet run`.  
+   La API estará disponible en:
+   - `https://localhost:7292` (HTTPS)
+   - `http://localhost:5283` (HTTP)
+
+2. **Envía una imagen o vídeo para analizar**  
+   Usa Postman o una herramienta similar:
+   - Método: `POST`
+   - URL: `https://localhost:7292/api/file/analyze`
+   - Body: `form-data`
+     - Campo `file`: Selecciona el archivo a subir (imagen o vídeo)
+     - Campo `DetailedAnalysis`: `true` o `false` (si se omite o es `false`, la respuesta será simplificada)
+
+3. **Modificar parámetros técnicos**  
+   El usuario puede editar únicamente el archivo `appsettings.json` para:
+   - Añadir o modificar resoluciones esperadas por modelo de dispositivo, por ejemplo:
+     ```
+     "TechnicalValidation": {
+       "ExpectedResolutions": {
+         "iPhone 13": "1170x2532|1284x2778",
+         "Canon EOS R5": "4480x6720|4128x6192"
+       }
+     }
+     ```
+   - Los cambios en este archivo afectan la validación técnica de los archivos subidos.
+
+---
+
+## Respuesta esperada en Postman
+
+- **Si `DetailedAnalysis` es `false` o no se envía:**
