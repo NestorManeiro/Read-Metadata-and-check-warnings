@@ -8,6 +8,8 @@ public class TechWarnings
     private List<string> _codecIssues = new();
     private List<string> _formatMismatches = new();
     private List<string> _compressionAnomalies = new();
+    public List<string> _blacklistAlerts = new(); // Nueva propiedad
+
 
     public List<string> ResolutionIssues
     {
@@ -31,5 +33,11 @@ public class TechWarnings
     {
         get => _compressionAnomalies.DefaultIfEmpty(NoIssues).ToList();
         set => _compressionAnomalies = value;
+    }
+
+    public List<string> BlacklistAlerts
+    {
+        get => _blacklistAlerts.DefaultIfEmpty(NoIssues).ToList();
+        set => _blacklistAlerts = value;
     }
 }

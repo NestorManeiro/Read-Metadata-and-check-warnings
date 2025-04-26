@@ -1,4 +1,5 @@
 ﻿using DeepFakeDetector.Models.Responses;
+using DeepFakeDetector.Utils;
 using Microsoft.Extensions.Configuration;
 
 namespace DeepFakeDetector.Services;
@@ -7,37 +8,48 @@ public class TechnicalValidator
 {
     private readonly IConfiguration _config;
     private readonly Dictionary<string, List<(int width, int height)>> _deviceResolutions;
+    private readonly List<string> _bannedCameras;
+    private readonly List<string> _bannedManufacturers;
 
     public TechnicalValidator(IConfiguration config)
     {
         _config = config;
-        _deviceResolutions = ParseResolutionConfig();
+        _deviceResolutions = ConfigParser.ParseResolutionConfig(_config);
+
+        var (cameras, manufacturers) = ConfigParser.ParseBlacklist(_config);
+        _bannedCameras = cameras;
+        _bannedManufacturers = manufacturers;
     }
-
-    private Dictionary<string, List<(int, int)>> ParseResolutionConfig()
-    {
-        var resolutions = _config.GetSection("TechnicalValidation:ExpectedResolutions")
-            .Get<Dictionary<string, string>>();
-
-        return resolutions?.ToDictionary(
-            kvp => kvp.Key,
-            kvp => kvp.Value.Split('|')
-                .Select(s => s.Split('x'))
-                .Select(parts => (int.Parse(parts[0]), int.Parse(parts[1])))
-                .ToList()
-        ) ?? new Dictionary<string, List<(int, int)>>();
-    }
-
     public TechWarnings ValidateTechnicalMetadata(Dictionary<string, string> metadata, string fileType)
     {
         var warnings = new TechWarnings();
 
+        ValidateBlacklist(metadata, warnings);
         ValidateResolution(metadata, warnings, fileType);
         ValidateCodecs(metadata, fileType, warnings);
         ValidateCompression(metadata, warnings);
 
         return warnings;
     }
+
+    private void ValidateBlacklist(Dictionary<string, string> metadata, TechWarnings warnings)
+    {
+        var model = metadata.GetValueOrDefault("Exif IFD0.Model");
+        var manufacturer = metadata.GetValueOrDefault("Exif IFD0.Make");
+
+        // Detección de modelos de cámaras IA
+        if (!string.IsNullOrEmpty(model) && _bannedCameras.Any(b => model.Contains(b, System.StringComparison.OrdinalIgnoreCase)))
+        {
+            warnings.BlacklistAlerts.Add($"Modelo de cámara en lista negra: {model}");
+        }
+
+        // Detección de fabricantes de IA
+        if (!string.IsNullOrEmpty(manufacturer) && _bannedManufacturers.Any(m => manufacturer.Contains(m, System.StringComparison.OrdinalIgnoreCase)))
+        {
+            warnings.BlacklistAlerts.Add($"Fabricante en lista negra: {manufacturer}");
+        }
+    }
+
 
     private void ValidateResolution(Dictionary<string, string> metadata, TechWarnings warnings, string fileType)
     {
