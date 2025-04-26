@@ -34,7 +34,6 @@ public class FileController : ControllerBase
         {
             var exifData = await _exifService.ExtractExifData(request.File);
 
-            // Usando operador ternario para seleccionar la respuesta
             return request.DetailedAnalysis
                 ? Ok(BuildFullResponse(exifData))
                 : Ok(BuildSimpleResponse(exifData));
@@ -52,10 +51,18 @@ public class FileController : ControllerBase
         FechaHoraCaptura = exifData.FechaHoraCaptura,
         Ubicacion = exifData.Metadata.GetValueOrDefault("GPS.GPSLatitude") != null
             ? $"{exifData.Metadata["GPS.GPSLatitude"]}, {exifData.Metadata["GPS.GPSLongitude"]}"
-            : exifData.Metadata.GetValueOrDefault("XMP.Location") // Ejemplo de alternativa
+            : exifData.Metadata.GetValueOrDefault("XMP.Location")
     };
 
-    private object BuildFullResponse(ExifResponse exifData) => exifData;
+    private object BuildFullResponse(ExifResponse exifData) => new
+    {
+        fileName = exifData.FileName,
+        fileType = exifData.FileType,
+        fechaHoraCaptura = exifData.FechaHoraCaptura,
+        ubicacion = exifData.Ubicacion,
+        warnings = exifData.Warnings,
+        metadata = exifData.Metadata // Aquí tienes TODOS los metadatos extraídos
+    };
 
     [HttpGet("test")]
     public IActionResult Test() => Ok("API operativa");

@@ -2,20 +2,18 @@
 using DeepFakeDetector.Models.Responses;
 using DeepFakeDetector.Services.Interfaces;
 using Microsoft.AspNetCore.Http;
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace DeepFakeDetector.Services
 {
     public class ExifService : IExifService
     {
-        private readonly TechnicalValidator _technicalValidator;
+        public ExifService() { }
 
-        public ExifService(TechnicalValidator technicalValidator)
-        {
-            _technicalValidator = technicalValidator;
-        }
         public async Task<ExifResponse> ExtractExifData(IFormFile file)
         {
             using var stream = new MemoryStream();
@@ -28,45 +26,41 @@ namespace DeepFakeDetector.Services
             {
                 FileName = file.FileName,
                 FileType = file.ContentType,
-                Metadata = new Dictionary<string, string>()
+                Metadata = new Dictionary<string, string>(),
+                Warnings = new List<string>()
             };
 
-            // Extracción estándar de metadatos
+            // Extraer todos los metadatos posibles
             foreach (var directory in directories)
             {
                 foreach (var tag in directory.Tags)
                 {
                     response.Metadata[$"{directory.Name}.{tag.Name}"] = tag.Description;
                 }
-
-                // Capturar errores que pueden contener info valiosa sobre estructura interna
                 foreach (var error in directory.Errors)
                 {
                     response.Metadata[$"{directory.Name}.Error"] = error;
                 }
             }
 
-            // NUEVO: Buscar específicamente bloques C2PA/JUMD
-            await DetectC2PABlocks(stream, response);
+            // Extraer chunks y firmas IA
+            await ExtractDeepMetadata(stream, response);
 
             ValidateEssentialMetadata(response);
             ExtractLocation(response);
             ExtractCaptureDate(response);
+
             return response;
         }
 
-        // Nuevo método para detectar bloques C2PA
-        private async Task DetectC2PABlocks(MemoryStream stream, ExifResponse response)
+        private async Task ExtractDeepMetadata(MemoryStream stream, ExifResponse response)
         {
             stream.Position = 0;
             byte[] buffer = stream.ToArray();
 
-            // 1. Buscar marcadores C2PA en el contenido binario
+            // Firmas IA en binario
             string fileContent = System.Text.Encoding.ASCII.GetString(buffer);
-
-            // Buscar cadenas típicas de C2PA/JUMD/Sora
             string[] aiSignatures = new[] { "c2pa", "JUMD", "Sora", "trainedAlgorithm", "GPT", "OpenAI" };
-
             foreach (var signature in aiSignatures)
             {
                 if (fileContent.IndexOf(signature, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -76,49 +70,49 @@ namespace DeepFakeDetector.Services
                 }
             }
 
-            // 2. Buscar bloques específicos PNG que puedan contener C2PA
-            try
+            // Chunks de PNG
+            if (response.FileType.Contains("png", StringComparison.OrdinalIgnoreCase))
             {
-                // Para PNG, buscar bloques iTXt o tEXt con datos C2PA
-                // Este es un enfoque simplificado, podría requerir una biblioteca especializada
-                int offset = 8; // Saltar la cabecera PNG
-                while (offset < buffer.Length - 8)
+                try
                 {
-                    // Leer tamaño y tipo del bloque
-                    int chunkLength = (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
-                                      (buffer[offset + 2] << 8) | buffer[offset + 3];
-
-                    string chunkType = System.Text.Encoding.ASCII.GetString(
-                        buffer, offset + 4, 4);
-
-                    // Verificar si es un bloque de texto (donde podría estar C2PA)
-                    if (chunkType == "iTXt" || chunkType == "tEXt")
+                    int offset = 8;
+                    int chunkNum = 0;
+                    while (offset < buffer.Length - 8)
                     {
-                        string chunkData = System.Text.Encoding.ASCII.GetString(
-                            buffer, offset + 8, Math.Min(chunkLength, 100)); // Leer parte del contenido
+                        int chunkLength = (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
+                                          (buffer[offset + 2] << 8) | buffer[offset + 3];
+                        string chunkType = System.Text.Encoding.ASCII.GetString(buffer, offset + 4, 4);
+                        response.Metadata[$"PNG.Chunk{chunkNum}.Type"] = chunkType;
+                        response.Metadata[$"PNG.Chunk{chunkNum}.Length"] = chunkLength.ToString();
 
-                        if (chunkData.Contains("c2pa", StringComparison.OrdinalIgnoreCase) ||
-                            chunkData.Contains("jumd", StringComparison.OrdinalIgnoreCase))
+                        // Si es texto, extraer parte del contenido
+                        if (chunkType == "iTXt" || chunkType == "tEXt")
                         {
-                            response.Metadata[$"PNG_Block.{chunkType}"] = "Contiene datos C2PA";
-                            response.Warnings.Add($"Bloque PNG {chunkType} contiene marcadores C2PA");
+                            string chunkData = System.Text.Encoding.ASCII.GetString(
+                                buffer, offset + 8, Math.Min(chunkLength, 100));
+                            response.Metadata[$"PNG.Chunk{chunkNum}.Data"] = chunkData;
+                            if (chunkData.Contains("c2pa", StringComparison.OrdinalIgnoreCase) ||
+                                chunkData.Contains("jumd", StringComparison.OrdinalIgnoreCase))
+                            {
+                                response.Metadata[$"PNG_Block.{chunkType}"] = "Contiene datos C2PA";
+                                response.Warnings.Add($"Bloque PNG {chunkType} contiene marcadores C2PA");
+                            }
                         }
+                        offset += 12 + chunkLength;
+                        chunkNum++;
                     }
-
-                    // Avanzar al siguiente bloque
-                    offset += 12 + chunkLength; // 8 bytes header + 4 bytes CRC + datos
+                }
+                catch (Exception ex)
+                {
+                    response.Metadata["PNG_Block.Error"] = ex.Message;
                 }
             }
-            catch (Exception ex)
-            {
-                // Error al analizar estructura PNG
-                response.Metadata["PNG_Block.Error"] = ex.Message;
-            }
         }
+
         private void ExtractLocation(ExifResponse response)
         {
             response.Ubicacion = response.Metadata.TryGetValue("GPS.GPSLatitude", out var lat) &&
-                                response.Metadata.TryGetValue("GPS.GPSLongitude", out var lon)
+                                 response.Metadata.TryGetValue("GPS.GPSLongitude", out var lon)
                 ? $"{lat}, {lon}"
                 : response.Metadata.GetValueOrDefault("XMP.Location") ?? "No disponible";
         }
@@ -129,35 +123,42 @@ namespace DeepFakeDetector.Services
                                      ?? response.Metadata.GetValueOrDefault("ICC Profile.Profile Date/Time");
         }
 
-        public async Task<bool> ValidateTemporalConsistency(IFormFile file)
-        {
-            var exifData = await ExtractExifData(file);
-            return exifData.Metadata.ContainsKey("Exif SubIFD.DateTimeOriginal") &&
-                   System.DateTime.TryParse(exifData.Metadata["Exif SubIFD.DateTimeOriginal"], out _);
-        }
-
-        public async Task<Dictionary<string, string>> GetSoftwareSignatures(IFormFile file)
-        {
-            var exifData = await ExtractExifData(file);
-            return exifData.Metadata
-                .Where(kv => kv.Key.Contains("Software") || kv.Key.Contains("Processing"))
-                .ToDictionary(kv => kv.Key, kv => kv.Value);
-        }
-
         private void ValidateEssentialMetadata(ExifResponse response)
         {
             var baseCriticalTags = new[] {
-        "Exif IFD0.Make",
-        "Exif IFD0.Model",
-        "File.FileModifiedDate"
-    };
+                "Exif IFD0.Make",
+                "Exif IFD0.Model",
+                "File.FileModifiedDate"
+            };
+            var hasCameraMetadata = response.Metadata.ContainsKey("Exif IFD0.Make") &&
+                      response.Metadata.ContainsKey("Exif IFD0.Model");
 
-            // Solo verificar XMP si hay indicios de IA
+            if (!hasCameraMetadata)
+            {
+                response.Warnings.Add("No se detectó información de cámara - posible imagen generada por IA");
+            }
+            else
+            {
+                // Verificar si los valores de cámara son plausibles
+                var make = response.Metadata["Exif IFD0.Make"];
+                var model = response.Metadata["Exif IFD0.Model"];
+
+                if (string.IsNullOrWhiteSpace(make) || make == "undefined")
+                {
+                    response.Warnings.Add("Fabricante de cámara no válido");
+                }
+
+                if (string.IsNullOrWhiteSpace(model) || model == "undefined")
+                {
+                    response.Warnings.Add("Modelo de cámara no válido");
+                }
+            }
+
             var xmpCriticalTags = new[] {
-        "XMP-xmp:CreatorTool",
-        "XMP-digitalsourcetype",
-        "XMP-xmpMM:InstanceID"
-    };
+                "XMP-xmp:CreatorTool",
+                "XMP-digitalsourcetype",
+                "XMP-xmpMM:InstanceID"
+            };
 
             foreach (var tag in baseCriticalTags.Where(t => !response.Metadata.ContainsKey(t)))
             {
@@ -176,14 +177,33 @@ namespace DeepFakeDetector.Services
             // Detección robusta de C2PA/JUMD
             var c2paEvidence = response.Metadata
                 .Where(kv => kv.Key.Contains("C2PA", StringComparison.OrdinalIgnoreCase) ||
-                            kv.Key.Contains("JUMD", StringComparison.OrdinalIgnoreCase) ||
-                            kv.Value.Contains("c2pa", StringComparison.OrdinalIgnoreCase))
+                             kv.Key.Contains("JUMD", StringComparison.OrdinalIgnoreCase) ||
+                             kv.Value.Contains("c2pa", StringComparison.OrdinalIgnoreCase))
                 .Select(kv => $"[{kv.Key}] = {kv.Value}");
 
             if (c2paEvidence.Any())
             {
                 response.Warnings.Add($"Evidencia C2PA detectada: {string.Join("; ", c2paEvidence)}");
             }
+
+        }
+
+        // Implementación explícita de la interfaz
+        async Task<bool> IExifService.ValidateTemporalConsistency(IFormFile file)
+        {
+            var exifData = await ExtractExifData(file);
+            return exifData.Metadata.ContainsKey("Exif SubIFD.DateTimeOriginal") &&
+                   DateTime.TryParse(exifData.Metadata["Exif SubIFD.DateTimeOriginal"], out _);
+        }
+
+        // Implementación explícita de la interfaz  
+        async Task<Dictionary<string, string>> IExifService.GetSoftwareSignatures(IFormFile file)
+        {
+            var exifData = await ExtractExifData(file);
+            return exifData.Metadata
+                .Where(kv => kv.Key.Contains("Software") || kv.Key.Contains("Processing"))
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
         }
     }
 }
+
