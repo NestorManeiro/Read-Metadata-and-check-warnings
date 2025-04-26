@@ -38,6 +38,7 @@ Este sistema representa una capa crítica de defensa en un panorama donde los de
 - [ ] **Análisis de metadatos**
   - [X] Revisión de datos EXIF (fecha, dispositivo, software de edición)
   - [X] Detección de inconsistencias en metadatos técnicos (resolución, formato, codecs)
+  - [X] BlackList de determinadas camaras
   - [ ] Comparación de hashes contra bases de datos de archivos originales
 
 - [ ] **Redes neuronales preentrenadas**
