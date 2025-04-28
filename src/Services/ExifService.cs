@@ -3,23 +3,32 @@ using MetadataExtractor.Formats.Exif;
 using MetadataExtractor.Formats.FileSystem;
 using DeepFakeDetector.Models.Responses;
 using DeepFakeDetector.Services.Interfaces;
+using DeepFakeDetector.Models.Configuration;
+using Microsoft.Extensions.Options;
 using System.Globalization;
 using System.Text;
 using Dir = MetadataExtractor.Directory;
+using System.Linq;
+using MetadataExtractor.Formats.Iptc;
+using MetadataExtractor.Formats.Xmp;
 
 namespace DeepFakeDetector.Services
 {
     public class ExifService : IExifService
     {
-        public ExifService() { }
+        private readonly TechnicalValidationConfig _config;
+
+        public ExifService(IOptions<TechnicalValidationConfig> configOptions)
+        {
+            _config = configOptions.Value;
+            if (_config == null) throw new ArgumentNullException(nameof(configOptions));
+        }
 
         public async Task<ExifResponse> ExtractExifData(IFormFile file)
         {
             using var stream = new MemoryStream();
             await file.CopyToAsync(stream);
             stream.Position = 0;
-
-            // Clonar el stream para evitar problemas de posición
             var buffer = stream.ToArray();
             using var metadataStream = new MemoryStream(buffer);
 
@@ -33,7 +42,6 @@ namespace DeepFakeDetector.Services
                 Warnings = new List<string>()
             };
 
-            // Extraer todos los metadatos posibles
             foreach (var directory in directories)
             {
                 foreach (var tag in directory.Tags)
@@ -46,26 +54,19 @@ namespace DeepFakeDetector.Services
                 }
             }
 
-            // Extraer firmas IA y chunks si es PNG
             await ExtractDeepMetadata(buffer, response, file.ContentType);
-
-            // Extraer ubicación GPS y fecha de captura
             ExtractLocation(directories, response);
             ExtractCaptureDate(directories, response);
-
-            // Validar metadatos críticos
             ValidateEssentialMetadata(directories, response);
+            ValidateResolution(directories, response);
+            CheckBlacklist(response);
 
             return response;
         }
 
         private async Task ExtractDeepMetadata(byte[] buffer, ExifResponse response, string fileType)
         {
-            // Buscar firmas IA en los metadatos, no en el binario crudo
-            string[] aiSignatures = new[] { "c2pa", "JUMD", "Sora", "trainedAlgorithm", "GPT", "OpenAI" };
-
-            // Buscar en los metadatos extraídos
-            foreach (var signature in aiSignatures)
+            foreach (var signature in _config.Blacklist.Keywords)
             {
                 if (response.Metadata.Any(kv =>
                     kv.Key.Contains(signature, StringComparison.OrdinalIgnoreCase) ||
@@ -74,16 +75,17 @@ namespace DeepFakeDetector.Services
                     response.Metadata[$"AI_Signature.{signature}"] = "Detectado";
                     response.Warnings.Add($"Posible contenido IA detectado: {signature}");
                 }
+
             }
 
-            // Si el archivo es PNG, buscar chunks especiales
-            if (fileType.Contains("png", StringComparison.OrdinalIgnoreCase))
+            if (fileType.Contains("png", StringComparison.OrdinalIgnoreCase) && _config.Blacklist.DeepSearch.Enabled)
             {
                 try
                 {
                     int offset = 8;
                     int chunkNum = 0;
-                    while (offset < buffer.Length - 8)
+                    int maxDepth = _config.Blacklist.DeepSearch.MaxDepth;
+                    while (offset < buffer.Length - 8 && offset < maxDepth)
                     {
                         int chunkLength = (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
                                           (buffer[offset + 2] << 8) | buffer[offset + 3];
@@ -92,17 +94,19 @@ namespace DeepFakeDetector.Services
                         response.Metadata[$"PNG.Chunk{chunkNum}.Type"] = chunkType;
                         response.Metadata[$"PNG.Chunk{chunkNum}.Length"] = chunkLength.ToString();
 
-                        // Si es texto, extraer parte del contenido
                         if (chunkType == "iTXt" || chunkType == "tEXt")
                         {
                             string chunkData = Encoding.ASCII.GetString(
                                 buffer, offset + 8, Math.Min(chunkLength, 100));
                             response.Metadata[$"PNG.Chunk{chunkNum}.Data"] = chunkData;
-                            if (chunkData.Contains("c2pa", StringComparison.OrdinalIgnoreCase) ||
-                                chunkData.Contains("jumd", StringComparison.OrdinalIgnoreCase))
+
+                            foreach (var pattern in _config.Blacklist.DeepSearch.BinaryPatterns)
                             {
-                                response.Metadata[$"PNG_Block.{chunkType}"] = "Contiene datos C2PA";
-                                response.Warnings.Add($"Bloque PNG {chunkType} contiene marcadores C2PA");
+                                if (chunkData.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    response.Metadata[$"PNG_Block.{chunkType}"] = $"Contiene datos {pattern}";
+                                    response.Warnings.Add($"Bloque PNG {chunkType} contiene marcadores {pattern}");
+                                }
                             }
                         }
                         offset += 12 + chunkLength;
@@ -139,7 +143,6 @@ namespace DeepFakeDetector.Services
             }
             else
             {
-                // Intentar con otras fuentes
                 var fileDir = directories.OfType<FileMetadataDirectory>().FirstOrDefault();
                 var fileDate = fileDir?.GetDescription(FileMetadataDirectory.TagFileModifiedDate);
                 response.FechaHoraCaptura = fileDate ?? "No disponible";
@@ -148,40 +151,97 @@ namespace DeepFakeDetector.Services
 
         private void ValidateEssentialMetadata(IReadOnlyList<Dir> directories, ExifResponse response)
         {
-            // Verificar metadatos críticos de cámara
-            var ifd0 = directories.OfType<ExifIfd0Directory>().FirstOrDefault();
-            var make = ifd0?.GetDescription(ExifDirectoryBase.TagMake);
-            var model = ifd0?.GetDescription(ExifDirectoryBase.TagModel);
-
-            if (string.IsNullOrWhiteSpace(make) || string.IsNullOrWhiteSpace(model))
+            foreach (var field in _config.CriticalExifFields)
             {
-                response.Warnings.Add("No se detectó información de cámara - posible imagen generada por IA");
-            }
+                var parts = field.Split('.');
+                if (parts.Length != 2) continue;
 
-            // Verificar fecha de modificación de archivo
-            var fileDir = directories.OfType<FileMetadataDirectory>().FirstOrDefault();
-            if (fileDir == null || fileDir.GetDescription(FileMetadataDirectory.TagFileModifiedDate) == null)
-            {
-                response.Warnings.Add("Falta metadato crítico: File.FileModifiedDate");
-            }
+                var dirKey = parts[0];
+                var expectedTag = parts[1];
 
-            // Verificar Make y Model explícitamente
-            if (string.IsNullOrWhiteSpace(make))
-                response.Warnings.Add("Falta metadato crítico: Exif IFD0.Make");
-            if (string.IsNullOrWhiteSpace(model))
-                response.Warnings.Add("Falta metadato crítico: Exif IFD0.Model");
+                var directory = directories.FirstOrDefault(d =>
+                    d.Name.Replace(" ", "").Equals(dirKey, StringComparison.OrdinalIgnoreCase));
+
+                if (directory == null)
+                {
+                    response.Warnings.Add($"Falta metadato crítico: {field}");
+                    continue;
+                }
+
+                var tag = directory.Tags.FirstOrDefault(t =>
+                    t.Name.Replace("/", "").Replace(" ", "")
+                        .Equals(expectedTag, StringComparison.OrdinalIgnoreCase));
+
+                if (tag == null || string.IsNullOrEmpty(tag.Description))
+                {
+                    response.Warnings.Add($"Falta metadato crítico: {field}");
+                }
+                else
+                {
+                    response.Warnings.Add($"Metadato crítico verificado: {field} - {tag.Description}");
+                }
+            }
         }
 
-        // Implementación explícita de la interfaz
-        async Task<bool> IExifService.ValidateTemporalConsistency(IFormFile file)
+        private void ValidateResolution(IReadOnlyList<Dir> directories, ExifResponse response)
+        {
+            var exifDir = directories.OfType<ExifSubIfdDirectory>().FirstOrDefault();
+            var width = exifDir?.GetInt32(ExifDirectoryBase.TagExifImageWidth);
+            var height = exifDir?.GetInt32(ExifDirectoryBase.TagExifImageHeight);
+
+            var model = response.Metadata
+                .FirstOrDefault(kv => kv.Key == "ExifIfd0Directory.Model").Value;
+
+            if (!string.IsNullOrWhiteSpace(model) &&
+                _config.ExpectedResolutions.TryGetValue(model, out var expected))
+            {
+                var currentResolution = $"{width}x{height}";
+                var expectedResolutions = expected.Split('|');
+
+                if (!expectedResolutions.Contains(currentResolution))
+                {
+                    response.Warnings.Add($"Resolución inesperada para {model}: {currentResolution}, esperada: {expected}");
+                }
+            }
+        }
+
+        private void CheckBlacklist(ExifResponse response)
+        {
+            var model = response.Metadata.FirstOrDefault(kv => kv.Key == "ExifIfd0Directory.Model").Value;
+            if (!string.IsNullOrWhiteSpace(model) && _config.Blacklist.Cameras.Contains(model))
+            {
+                response.Warnings.Add($"Cámara en lista negra: {model}");
+            }
+
+            var make = response.Metadata.FirstOrDefault(kv => kv.Key == "ExifIfd0Directory.Make").Value;
+            if (!string.IsNullOrWhiteSpace(make) && _config.Blacklist.Manufacturers.Contains(make))
+            {
+                response.Warnings.Add($"Fabricante en lista negra: {make}");
+            }
+
+            foreach (var entry in response.Metadata)
+            {
+                if (entry.Key.Contains("Software", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var agent in _config.Blacklist.SoftwareAgents)
+                    {
+                        if (entry.Value.Contains(agent, StringComparison.OrdinalIgnoreCase))
+                        {
+                            response.Warnings.Add($"Software en lista negra: {agent}");
+                        }
+                    }
+                }
+            }
+        }
+
+        public async Task<bool> ValidateTemporalConsistency(IFormFile file)
         {
             var exifData = await ExtractExifData(file);
             return !string.IsNullOrEmpty(exifData.FechaHoraCaptura) &&
                    exifData.FechaHoraCaptura != "No disponible";
         }
 
-        // Implementación explícita de la interfaz  
-        async Task<Dictionary<string, string>> IExifService.GetSoftwareSignatures(IFormFile file)
+        public async Task<Dictionary<string, string>> GetSoftwareSignatures(IFormFile file)
         {
             var exifData = await ExtractExifData(file);
             return exifData.Metadata

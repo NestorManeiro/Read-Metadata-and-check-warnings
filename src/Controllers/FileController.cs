@@ -49,9 +49,7 @@ public class FileController : ControllerBase
     {
         Warnings = exifData.Warnings,
         FechaHoraCaptura = exifData.FechaHoraCaptura,
-        Ubicacion = exifData.Metadata.GetValueOrDefault("GPS.GPSLatitude") != null
-            ? $"{exifData.Metadata["GPS.GPSLatitude"]}, {exifData.Metadata["GPS.GPSLongitude"]}"
-            : exifData.Metadata.GetValueOrDefault("XMP.Location")
+        Ubicacion = exifData.Ubicacion
     };
 
     private object BuildFullResponse(ExifResponse exifData) => new
