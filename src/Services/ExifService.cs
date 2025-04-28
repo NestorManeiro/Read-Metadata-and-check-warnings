@@ -1,12 +1,11 @@
 ﻿using MetadataExtractor;
+using MetadataExtractor.Formats.Exif;
+using MetadataExtractor.Formats.FileSystem;
 using DeepFakeDetector.Models.Responses;
 using DeepFakeDetector.Services.Interfaces;
-using Microsoft.AspNetCore.Http;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.Globalization;
 using System.Text;
-using System.Threading.Tasks;
+using Dir = MetadataExtractor.Directory;
 
 namespace DeepFakeDetector.Services
 {
@@ -20,7 +19,11 @@ namespace DeepFakeDetector.Services
             await file.CopyToAsync(stream);
             stream.Position = 0;
 
-            var directories = ImageMetadataReader.ReadMetadata(stream);
+            // Clonar el stream para evitar problemas de posición
+            var buffer = stream.ToArray();
+            using var metadataStream = new MemoryStream(buffer);
+
+            var directories = ImageMetadataReader.ReadMetadata(metadataStream);
 
             var response = new ExifResponse
             {
@@ -35,43 +38,46 @@ namespace DeepFakeDetector.Services
             {
                 foreach (var tag in directory.Tags)
                 {
-                    response.Metadata[$"{directory.Name}.{tag.Name}"] = tag.Description;
+                    response.Metadata[$"{directory.GetType().Name}.{tag.Name}"] = tag.Description;
                 }
                 foreach (var error in directory.Errors)
                 {
-                    response.Metadata[$"{directory.Name}.Error"] = error;
+                    response.Metadata[$"{directory.GetType().Name}.Error"] = error;
                 }
             }
 
-            // Extraer chunks y firmas IA
-            await ExtractDeepMetadata(stream, response);
+            // Extraer firmas IA y chunks si es PNG
+            await ExtractDeepMetadata(buffer, response, file.ContentType);
 
-            ValidateEssentialMetadata(response);
-            ExtractLocation(response);
-            ExtractCaptureDate(response);
+            // Extraer ubicación GPS y fecha de captura
+            ExtractLocation(directories, response);
+            ExtractCaptureDate(directories, response);
+
+            // Validar metadatos críticos
+            ValidateEssentialMetadata(directories, response);
 
             return response;
         }
 
-        private async Task ExtractDeepMetadata(MemoryStream stream, ExifResponse response)
+        private async Task ExtractDeepMetadata(byte[] buffer, ExifResponse response, string fileType)
         {
-            stream.Position = 0;
-            byte[] buffer = stream.ToArray();
-
-            // Firmas IA en binario
-            string fileContent = System.Text.Encoding.ASCII.GetString(buffer);
+            // Buscar firmas IA en los metadatos, no en el binario crudo
             string[] aiSignatures = new[] { "c2pa", "JUMD", "Sora", "trainedAlgorithm", "GPT", "OpenAI" };
+
+            // Buscar en los metadatos extraídos
             foreach (var signature in aiSignatures)
             {
-                if (fileContent.IndexOf(signature, StringComparison.OrdinalIgnoreCase) >= 0)
+                if (response.Metadata.Any(kv =>
+                    kv.Key.Contains(signature, StringComparison.OrdinalIgnoreCase) ||
+                    kv.Value.Contains(signature, StringComparison.OrdinalIgnoreCase)))
                 {
                     response.Metadata[$"AI_Signature.{signature}"] = "Detectado";
                     response.Warnings.Add($"Posible contenido IA detectado: {signature}");
                 }
             }
 
-            // Chunks de PNG
-            if (response.FileType.Contains("png", StringComparison.OrdinalIgnoreCase))
+            // Si el archivo es PNG, buscar chunks especiales
+            if (fileType.Contains("png", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
@@ -81,14 +87,15 @@ namespace DeepFakeDetector.Services
                     {
                         int chunkLength = (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
                                           (buffer[offset + 2] << 8) | buffer[offset + 3];
-                        string chunkType = System.Text.Encoding.ASCII.GetString(buffer, offset + 4, 4);
+                        string chunkType = Encoding.ASCII.GetString(buffer, offset + 4, 4);
+
                         response.Metadata[$"PNG.Chunk{chunkNum}.Type"] = chunkType;
                         response.Metadata[$"PNG.Chunk{chunkNum}.Length"] = chunkLength.ToString();
 
                         // Si es texto, extraer parte del contenido
                         if (chunkType == "iTXt" || chunkType == "tEXt")
                         {
-                            string chunkData = System.Text.Encoding.ASCII.GetString(
+                            string chunkData = Encoding.ASCII.GetString(
                                 buffer, offset + 8, Math.Min(chunkLength, 100));
                             response.Metadata[$"PNG.Chunk{chunkNum}.Data"] = chunkData;
                             if (chunkData.Contains("c2pa", StringComparison.OrdinalIgnoreCase) ||
@@ -107,93 +114,70 @@ namespace DeepFakeDetector.Services
                     response.Metadata["PNG_Block.Error"] = ex.Message;
                 }
             }
+
+            await Task.CompletedTask;
         }
 
-        private void ExtractLocation(ExifResponse response)
+        private void ExtractLocation(IReadOnlyList<Dir> directories, ExifResponse response)
         {
-            response.Ubicacion = response.Metadata.TryGetValue("GPS.GPSLatitude", out var lat) &&
-                                 response.Metadata.TryGetValue("GPS.GPSLongitude", out var lon)
-                ? $"{lat}, {lon}"
-                : response.Metadata.GetValueOrDefault("XMP.Location") ?? "No disponible";
+            var gpsDir = directories.OfType<GpsDirectory>().FirstOrDefault();
+            var location = gpsDir?.GetGeoLocation();
+
+            response.Ubicacion = location != null
+                ? $"{location.Latitude:0.000000},{location.Longitude:0.000000}"
+                : "No disponible";
         }
 
-        private void ExtractCaptureDate(ExifResponse response)
+        private void ExtractCaptureDate(IReadOnlyList<Dir> directories, ExifResponse response)
         {
-            response.FechaHoraCaptura = response.Metadata.GetValueOrDefault("Exif SubIFD.DateTimeOriginal")
-                                     ?? response.Metadata.GetValueOrDefault("ICC Profile.Profile Date/Time");
-        }
+            var subIfd = directories.OfType<ExifSubIfdDirectory>().FirstOrDefault();
+            var dateString = subIfd?.GetDescription(ExifDirectoryBase.TagDateTimeOriginal);
 
-        private void ValidateEssentialMetadata(ExifResponse response)
-        {
-            var baseCriticalTags = new[] {
-                "Exif IFD0.Make",
-                "Exif IFD0.Model",
-                "File.FileModifiedDate"
-            };
-            var hasCameraMetadata = response.Metadata.ContainsKey("Exif IFD0.Make") &&
-                      response.Metadata.ContainsKey("Exif IFD0.Model");
-
-            if (!hasCameraMetadata)
+            if (DateTime.TryParseExact(dateString, "yyyy:MM:dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
             {
-                response.Warnings.Add("No se detectó información de cámara - posible imagen generada por IA");
+                response.FechaHoraCaptura = date.ToString("yyyy-MM-dd HH:mm:ss");
             }
             else
             {
-                // Verificar si los valores de cámara son plausibles
-                var make = response.Metadata["Exif IFD0.Make"];
-                var model = response.Metadata["Exif IFD0.Model"];
-
-                if (string.IsNullOrWhiteSpace(make) || make == "undefined")
-                {
-                    response.Warnings.Add("Fabricante de cámara no válido");
-                }
-
-                if (string.IsNullOrWhiteSpace(model) || model == "undefined")
-                {
-                    response.Warnings.Add("Modelo de cámara no válido");
-                }
+                // Intentar con otras fuentes
+                var fileDir = directories.OfType<FileMetadataDirectory>().FirstOrDefault();
+                var fileDate = fileDir?.GetDescription(FileMetadataDirectory.TagFileModifiedDate);
+                response.FechaHoraCaptura = fileDate ?? "No disponible";
             }
+        }
 
-            var xmpCriticalTags = new[] {
-                "XMP-xmp:CreatorTool",
-                "XMP-digitalsourcetype",
-                "XMP-xmpMM:InstanceID"
-            };
+        private void ValidateEssentialMetadata(IReadOnlyList<Dir> directories, ExifResponse response)
+        {
+            // Verificar metadatos críticos de cámara
+            var ifd0 = directories.OfType<ExifIfd0Directory>().FirstOrDefault();
+            var make = ifd0?.GetDescription(ExifDirectoryBase.TagMake);
+            var model = ifd0?.GetDescription(ExifDirectoryBase.TagModel);
 
-            foreach (var tag in baseCriticalTags.Where(t => !response.Metadata.ContainsKey(t)))
+            if (string.IsNullOrWhiteSpace(make) || string.IsNullOrWhiteSpace(model))
             {
-                response.Warnings.Add($"Falta metadato crítico: {tag}");
+                response.Warnings.Add("No se detectó información de cámara - posible imagen generada por IA");
             }
 
-            // Verificar XMP solo si hay metadata de IA
-            if (response.Metadata.Any(kv => kv.Key.Contains("C2PA", StringComparison.OrdinalIgnoreCase)))
+            // Verificar fecha de modificación de archivo
+            var fileDir = directories.OfType<FileMetadataDirectory>().FirstOrDefault();
+            if (fileDir == null || fileDir.GetDescription(FileMetadataDirectory.TagFileModifiedDate) == null)
             {
-                foreach (var tag in xmpCriticalTags.Where(t => !response.Metadata.ContainsKey(t)))
-                {
-                    response.Warnings.Add($"Falta metadato crítico para IA: {tag}");
-                }
+                response.Warnings.Add("Falta metadato crítico: File.FileModifiedDate");
             }
 
-            // Detección robusta de C2PA/JUMD
-            var c2paEvidence = response.Metadata
-                .Where(kv => kv.Key.Contains("C2PA", StringComparison.OrdinalIgnoreCase) ||
-                             kv.Key.Contains("JUMD", StringComparison.OrdinalIgnoreCase) ||
-                             kv.Value.Contains("c2pa", StringComparison.OrdinalIgnoreCase))
-                .Select(kv => $"[{kv.Key}] = {kv.Value}");
-
-            if (c2paEvidence.Any())
-            {
-                response.Warnings.Add($"Evidencia C2PA detectada: {string.Join("; ", c2paEvidence)}");
-            }
-
+            // Verificar Make y Model explícitamente
+            if (string.IsNullOrWhiteSpace(make))
+                response.Warnings.Add("Falta metadato crítico: Exif IFD0.Make");
+            if (string.IsNullOrWhiteSpace(model))
+                response.Warnings.Add("Falta metadato crítico: Exif IFD0.Model");
         }
 
         // Implementación explícita de la interfaz
         async Task<bool> IExifService.ValidateTemporalConsistency(IFormFile file)
         {
             var exifData = await ExtractExifData(file);
-            return exifData.Metadata.ContainsKey("Exif SubIFD.DateTimeOriginal") &&
-                   DateTime.TryParse(exifData.Metadata["Exif SubIFD.DateTimeOriginal"], out _);
+            return !string.IsNullOrEmpty(exifData.FechaHoraCaptura) &&
+                   exifData.FechaHoraCaptura != "No disponible";
         }
 
         // Implementación explícita de la interfaz  
@@ -201,9 +185,9 @@ namespace DeepFakeDetector.Services
         {
             var exifData = await ExtractExifData(file);
             return exifData.Metadata
-                .Where(kv => kv.Key.Contains("Software") || kv.Key.Contains("Processing"))
+                .Where(kv => kv.Key.Contains("Software", StringComparison.OrdinalIgnoreCase) ||
+                             kv.Key.Contains("Processing", StringComparison.OrdinalIgnoreCase))
                 .ToDictionary(kv => kv.Key, kv => kv.Value);
         }
     }
 }
-
