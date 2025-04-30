@@ -23,14 +23,17 @@ namespace DeepFakeDetector.Services
             _config = configOptions.Value;
             if (_config == null) throw new ArgumentNullException(nameof(configOptions));
         }
+
         public async Task<ExifResponse> ExtractExifData(IFormFile file)
         {
+            // Read the file into a memory stream to extract metadata
             using var stream = new MemoryStream();
             await file.CopyToAsync(stream);
             stream.Position = 0;
             var buffer = stream.ToArray();
             using var metadataStream = new MemoryStream(buffer);
 
+            // Extract all metadata directories from the image
             var directories = ImageMetadataReader.ReadMetadata(metadataStream);
 
             var response = new ExifResponse
@@ -41,6 +44,7 @@ namespace DeepFakeDetector.Services
                 Warnings = new List<string>()
             };
 
+            // Iterate through all metadata tags and errors
             foreach (var directory in directories)
             {
                 foreach (var tag in directory.Tags)
@@ -53,30 +57,64 @@ namespace DeepFakeDetector.Services
                 }
             }
 
+            // Perform deep metadata extraction and various validations
             await ExtractDeepMetadata(buffer, response, file.ContentType);
             ExtractLocation(directories, response);
             ExtractCaptureDate(directories, response);
             ValidateEssentialMetadata(directories, response);
             ValidateResolution(directories, response);
             CheckBlacklist(response);
-            CheckC2PAMetadata(directories, response); // Nueva función para C2PA
-            ValidateMetadataConsistency(directories, response); // Mejora de consistencia
+            CheckC2PAMetadata(directories, response);
+            ValidateMetadataConsistency(directories, response);
+
+            // New: Check for anomalous or suspicious metadata patterns
+            CheckAnomalousMetadata(response);
 
             return response;
         }
+
+        private void CheckAnomalousMetadata(ExifResponse response)
+        {
+            // 1. Suspicious ICC Profile Date/Time
+            if (response.Metadata.TryGetValue("IccDirectory.Profile Date/Time", out string iccDate) && iccDate == "2016:01:01 00:00:00")
+            {
+                response.Warnings.Add("ICC profile date/time is 2016:01:01 00:00:00: This is commonly found in AI-generated images and does not match a recent capture.");
+            }
+            // 2. Generic Profile Date/Time (if present)
+            if (response.Metadata.TryGetValue("Profile Date/Time", out string profileDate) && profileDate == "2016:01:01 00:00:00")
+            {
+                response.Warnings.Add("Profile date/time is exactly January 1, 2016: This default value is often used by AI; only recent photos should be accepted.");
+            }
+            // 3. Suspicious Profile Copyright
+            if (response.Metadata.TryGetValue("IccDirectory.Profile Copyright", out string copyright) &&
+                copyright.Contains("Google Inc. 2016", StringComparison.OrdinalIgnoreCase))
+            {
+                response.Warnings.Add("Profile copyright is 'Google Inc. 2016': This is common in Pixel phones but also frequently used in AI-generated images.");
+            }
+            // 4. Atypical resolution values
+            bool hasResNone = response.Metadata.TryGetValue("JfifDirectory.Resolution Units", out string resUnits) && resUnits == "none";
+            bool hasXRes = response.Metadata.TryGetValue("JfifDirectory.X Resolution", out string xRes) && xRes == "1 dot";
+            bool hasYRes = response.Metadata.TryGetValue("JfifDirectory.Y Resolution", out string yRes) && yRes == "1 dot";
+            if (hasResNone && hasXRes && hasYRes)
+            {
+                response.Warnings.Add("Atypical resolution values: 'Resolution Units': 'none', 'X Resolution': '1 dot', 'Y Resolution': '1 dot'. These do not usually appear in real camera photos.");
+            }
+        }
+
         private async Task ExtractDeepMetadata(byte[] buffer, ExifResponse response, string fileType)
         {
-            // Detección de firmas C2PA y SynthID
+            // Detection of C2PA and SynthID signatures
             foreach (var signature in _config.Blacklist.Keywords)
             {
                 if (response.Metadata.Any(kv =>
                     kv.Key.Contains(signature, StringComparison.OrdinalIgnoreCase) ||
                     kv.Value.Contains(signature, StringComparison.OrdinalIgnoreCase)))
                 {
-                    response.Metadata[$"AI_Signature.{signature}"] = "Detectado";
-                    response.Warnings.Add($"Posible contenido IA detectado: {signature}");
+                    response.Metadata[$"AI_Signature.{signature}"] = "Detected";
+                    response.Warnings.Add($"Possible AI content detected: {signature}");
                 }
             }
+            // If PNG and deep search enabled, analyze PNG chunks for suspicious data
             if (fileType.Contains("png", StringComparison.OrdinalIgnoreCase) && _config.Blacklist.DeepSearch.Enabled)
             {
                 try
@@ -93,16 +131,16 @@ namespace DeepFakeDetector.Services
                         response.Metadata[$"PNG.Chunk{chunkNum}.Type"] = chunkType;
                         response.Metadata[$"PNG.Chunk{chunkNum}.Length"] = chunkLength.ToString();
 
-                        // ADVERTENCIA POR CHUNK PERSONALIZADO
+                        // WARNING FOR CUSTOM CHUNK
                         if (chunkType != "IHDR" && chunkType != "IDAT" && chunkType != "IEND" && chunkType != "PLTE" && chunkType != "tEXt" && chunkType != "iTXt" && chunkType != "zTXt")
                         {
                             if (chunkType == "caBX" && chunkLength >= 60000)
                             {
-                                response.Warnings.Add($"Estructura PNG anómala: Chunk personalizado '{chunkType}' de {chunkLength} bytes (inusual en imágenes naturales)");
+                                response.Warnings.Add($"Anomalous PNG structure: Custom chunk '{chunkType}' of {chunkLength} bytes (unusual in natural images)");
                             }
                             else
                             {
-                                response.Warnings.Add($"Estructura PNG: Chunk personalizado detectado '{chunkType}' de {chunkLength} bytes");
+                                response.Warnings.Add($"PNG structure: Custom chunk detected '{chunkType}' of {chunkLength} bytes");
                             }
                         }
 
@@ -116,8 +154,8 @@ namespace DeepFakeDetector.Services
                             {
                                 if (chunkData.Contains(pattern, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    response.Metadata[$"PNG_Block.{chunkType}"] = $"Contiene datos {pattern}";
-                                    response.Warnings.Add($"Bloque PNG {chunkType} contiene marcadores {pattern}");
+                                    response.Metadata[$"PNG_Block.{chunkType}"] = $"Contains {pattern} data";
+                                    response.Warnings.Add($"PNG block {chunkType} contains marker {pattern}");
                                 }
                             }
                         }
@@ -134,10 +172,10 @@ namespace DeepFakeDetector.Services
             await Task.CompletedTask;
         }
 
-        // Nueva función para detección específica de C2PA
+        // New function for specific C2PA detection
         private void CheckC2PAMetadata(IReadOnlyList<Dir> directories, ExifResponse response)
         {
-            const int IptcTagDigitalSourceType = 0x0237; // ID según estándar IPTC
+            const int IptcTagDigitalSourceType = 0x0237; // ID according to IPTC standard
 
             var iptcDir = directories.OfType<IptcDirectory>().FirstOrDefault();
             if (iptcDir != null && iptcDir.ContainsTag(IptcTagDigitalSourceType))
@@ -146,15 +184,15 @@ namespace DeepFakeDetector.Services
                 if (!string.IsNullOrEmpty(digitalSource) && digitalSource.Contains("generativeAI", StringComparison.OrdinalIgnoreCase))
                 {
                     response.Metadata["AI.GenerativeSource"] = digitalSource;
-                    response.Warnings.Add($"Fuente generativa detectada: {digitalSource}");
+                    response.Warnings.Add($"Generative source detected: {digitalSource}");
                 }
             }
         }
 
-        // Mejorada para incluir validación de GUID
+        // Improved to include GUID validation
         private void ValidateMetadataConsistency(IReadOnlyList<Dir> directories, ExifResponse response)
         {
-            // Verificar GUID de Midjourney
+            // Check for Midjourney GUID
             var xmpDir = directories.OfType<XmpDirectory>().FirstOrDefault();
             var guid = xmpDir?.XmpMeta?.Properties
                 .FirstOrDefault(p => p.Path?.Contains("ImageGUID", StringComparison.OrdinalIgnoreCase) == true)?.Value;
@@ -162,10 +200,10 @@ namespace DeepFakeDetector.Services
             if (!string.IsNullOrEmpty(guid))
             {
                 response.Metadata["AI.ImageGUID"] = guid;
-                response.Warnings.Add($"GUID de imagen generada detectado: {guid}");
+                response.Warnings.Add($"Generated image GUID detected: {guid}");
             }
 
-            // Validar consistencia entre metadatos
+            // Validate consistency between metadata
             var hasCameraInfo = directories.OfType<ExifIfd0Directory>().Any(d =>
                 d.ContainsTag(ExifDirectoryBase.TagMake) ||
                 d.ContainsTag(ExifDirectoryBase.TagModel));
@@ -175,7 +213,7 @@ namespace DeepFakeDetector.Services
 
             if (!hasCameraInfo && hasSoftwareTags)
             {
-                response.Warnings.Add("Inconsistencia detectada: Metadatos de cámara ausentes con tags de software presentes");
+                response.Warnings.Add("Inconsistency detected: Camera metadata missing but software tags present");
             }
         }
 
@@ -187,7 +225,7 @@ namespace DeepFakeDetector.Services
 
             if (width == null || height == null) return;
 
-            // Ratios estándar según fuentes técnicas [2][3][4][6]
+            // Standard aspect ratios according to technical sources
             var validRatios = new[] { "3:2", "4:3", "1:1", "5:4", "16:9" };
             var currentRatio = AspectRatioSimplificado(width.Value, height.Value);
 
@@ -196,11 +234,11 @@ namespace DeepFakeDetector.Services
 
             if (!isRatioValido && !tienePerfilCamara)
             {
-                response.Warnings.Add($"Relación de aspecto inusual para cámaras: {currentRatio} ({width}x{height})");
+                response.Warnings.Add($"Unusual aspect ratio for cameras: {currentRatio} ({width}x{height})");
             }
             else if (isRatioValido && !tienePerfilCamara)
             {
-                response.Warnings.Add($"Ratio {currentRatio} común pero sin perfil de cámara válido");
+                response.Warnings.Add($"Ratio {currentRatio} is common but no valid camera profile found");
             }
         }
 
@@ -219,19 +257,20 @@ namespace DeepFakeDetector.Services
                 d.ContainsTag(ExifDirectoryBase.TagModel));
         }
 
-
         private void ExtractLocation(IReadOnlyList<Dir> directories, ExifResponse response)
         {
+            // Extract GPS location from metadata if available
             var gpsDir = directories.OfType<GpsDirectory>().FirstOrDefault();
             var location = gpsDir?.GetGeoLocation();
 
             response.Ubicacion = location != null
                 ? $"{location.Latitude:0.000000},{location.Longitude:0.000000}"
-                : "No disponible";
+                : "Not available";
         }
 
         private void ExtractCaptureDate(IReadOnlyList<Dir> directories, ExifResponse response)
         {
+            // Try to extract original capture date from EXIF, fallback to file modification date
             var subIfd = directories.OfType<ExifSubIfdDirectory>().FirstOrDefault();
             var dateString = subIfd?.GetDescription(ExifDirectoryBase.TagDateTimeOriginal);
 
@@ -243,12 +282,13 @@ namespace DeepFakeDetector.Services
             {
                 var fileDir = directories.OfType<FileMetadataDirectory>().FirstOrDefault();
                 var fileDate = fileDir?.GetDescription(FileMetadataDirectory.TagFileModifiedDate);
-                response.FechaHoraCaptura = fileDate ?? "No disponible";
+                response.FechaHoraCaptura = fileDate ?? "Not available";
             }
         }
 
         private void ValidateEssentialMetadata(IReadOnlyList<Dir> directories, ExifResponse response)
         {
+            // Check for the presence of all critical EXIF fields configured
             foreach (var field in _config.CriticalExifFields)
             {
                 var parts = field.Split('.');
@@ -262,7 +302,7 @@ namespace DeepFakeDetector.Services
 
                 if (directory == null)
                 {
-                    response.Warnings.Add($"Falta metadato crítico: {field}");
+                    response.Warnings.Add($"Missing critical metadata: {field}");
                     continue;
                 }
 
@@ -272,43 +312,46 @@ namespace DeepFakeDetector.Services
 
                 if (tag == null || string.IsNullOrEmpty(tag.Description))
                 {
-                    response.Warnings.Add($"Falta metadato crítico: {field}");
+                    response.Warnings.Add($"Missing critical metadata: {field}");
                 }
                 else
                 {
-                    response.Warnings.Add($"Metadato crítico verificado: {field} - {tag.Description}");
+                    response.Warnings.Add($"Critical metadata verified: {field} - {tag.Description}");
                 }
             }
         }
-        // Actualizado para incluir fabricantes de IA
+
+        // Updated to include AI camera manufacturers
         private void CheckBlacklist(ExifResponse response)
         {
             var model = response.Metadata.FirstOrDefault(kv => kv.Key == "ExifIfd0Directory.Model").Value;
             if (!string.IsNullOrWhiteSpace(model) && _config.Blacklist.Cameras.Contains(model))
             {
-                response.Warnings.Add($"Cámara en lista negra: {model}");
+                response.Warnings.Add($"Blacklisted camera: {model}");
             }
 
-            // Detección de modelos específicos de IA
+            // Detection of specific AI models
             var aiSoftwarePatterns = new[] { "Stable Diffusion", "DALL-E", "Midjourney", "Firefly" };
             foreach (var pattern in aiSoftwarePatterns)
             {
                 if (response.Metadata.Any(kv => kv.Value.Contains(pattern, StringComparison.OrdinalIgnoreCase)))
                 {
-                    response.Warnings.Add($"Software de IA detectado: {pattern}");
+                    response.Warnings.Add($"AI software detected: {pattern}");
                 }
             }
         }
 
         public async Task<bool> ValidateTemporalConsistency(IFormFile file)
         {
+            // Validate if the image has a valid capture date
             var exifData = await ExtractExifData(file);
             return !string.IsNullOrEmpty(exifData.FechaHoraCaptura) &&
-                   exifData.FechaHoraCaptura != "No disponible";
+                   exifData.FechaHoraCaptura != "Not available";
         }
 
         public async Task<Dictionary<string, string>> GetSoftwareSignatures(IFormFile file)
         {
+            // Retrieve all software-related metadata tags
             var exifData = await ExtractExifData(file);
             return exifData.Metadata
                 .Where(kv => kv.Key.Contains("Software", StringComparison.OrdinalIgnoreCase) ||
